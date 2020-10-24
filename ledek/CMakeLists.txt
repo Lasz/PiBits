@@ -17,6 +17,7 @@ list( APPEND SOURCE_FILES
         dma.c
         gpio.c
         mailbox.c
+        main.c
         pwm.c
         servod.c
 )

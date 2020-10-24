@@ -45,10 +45,11 @@
 
 #include "mailbox.h"
 
-#define DMY	255	// Used to represent an invalid P1 pin, or unmapped servo
+#include "clk.h"
+#include "dma.h"
+#include "gpio.h"
+#include "pwm.h"
 
-#define NUM_P1PINS	40
-#define NUM_P5PINS	8
 
 #define MAX_SERVOS	32	/* Only 21 really, but this lets you map servo IDs
 				 * to P1 pins, if you want to
@@ -66,71 +67,14 @@
 #define PAGE_SIZE		4096
 #define PAGE_SHIFT		12
 
-#define DMA_CHAN_SIZE		0x100
-#define DMA_CHAN_MIN		0
-#define DMA_CHAN_MAX		14
-#define DMA_CHAN_DEFAULT	14
-#define DMA_CHAN_PI4		7
 
-#define DMA_BASE_OFFSET		0x00007000
-#define DMA_LEN			DMA_CHAN_SIZE * (DMA_CHAN_MAX+1)
-#define PWM_BASE_OFFSET		0x0020C000
-#define PWM_LEN			0x28
-#define CLK_BASE_OFFSET	        0x00101000
-#define CLK_LEN			0xA8
-#define GPIO_BASE_OFFSET	0x00200000
-#define GPIO_LEN		0x100
+
 #define PCM_BASE_OFFSET		0x00203000
 #define PCM_LEN			0x24
 
-#define DMA_VIRT_BASE		(periph_virt_base + DMA_BASE_OFFSET)
-#define PWM_VIRT_BASE		(periph_virt_base + PWM_BASE_OFFSET)
-#define CLK_VIRT_BASE		(periph_virt_base + CLK_BASE_OFFSET)
-#define GPIO_VIRT_BASE		(periph_virt_base + GPIO_BASE_OFFSET)
 #define PCM_VIRT_BASE		(periph_virt_base + PCM_BASE_OFFSET)
-
-#define PWM_PHYS_BASE		(periph_phys_base + PWM_BASE_OFFSET)
 #define PCM_PHYS_BASE		(periph_phys_base + PCM_BASE_OFFSET)
-#define GPIO_PHYS_BASE		(periph_phys_base + GPIO_BASE_OFFSET)
 
-#define DMA_NO_WIDE_BURSTS	(1<<26)
-#define DMA_WAIT_RESP		(1<<3)
-#define DMA_D_DREQ		(1<<6)
-#define DMA_PER_MAP(x)		((x)<<16)
-#define DMA_END			(1<<1)
-#define DMA_RESET		(1<<31)
-#define DMA_INT			(1<<2)
-
-#define DMA_CS			(0x00/4)
-#define DMA_CONBLK_AD		(0x04/4)
-#define DMA_SOURCE_AD		(0x0c/4)
-#define DMA_DEBUG		(0x20/4)
-
-#define GPIO_FSEL0		(0x00/4)
-#define GPIO_SET0		(0x1c/4)
-#define GPIO_CLR0		(0x28/4)
-#define GPIO_LEV0		(0x34/4)
-#define GPIO_PULLEN		(0x94/4)
-#define GPIO_PULLCLK		(0x98/4)
-
-#define GPIO_MODE_IN		0
-#define GPIO_MODE_OUT		1
-
-#define PWM_CTL			(0x00/4)
-#define PWM_DMAC		(0x08/4)
-#define PWM_RNG1		(0x10/4)
-#define PWM_FIFO		(0x18/4)
-
-#define PWMCLK_CNTL		40
-#define PWMCLK_DIV		41
-
-#define PWMCTL_MODE1		(1<<1)
-#define PWMCTL_PWEN1		(1<<0)
-#define PWMCTL_CLRF		(1<<6)
-#define PWMCTL_USEF1		(1<<5)
-
-#define PWMDMAC_ENAB		(1<<31)
-#define PWMDMAC_THRSHLD		((15<<8)|(15<<0))
 
 #define PCM_CS_A		(0x00/4)
 #define PCM_FIFO_A		(0x04/4)
@@ -145,18 +89,12 @@
 #define PCMCLK_CNTL		38
 #define PCMCLK_DIV		39
 
-#define PLLDFREQ_MHZ_DEFAULT	500
-#define PLLDFREQ_MHZ_PI4	750
-
-#define DELAY_VIA_PWM		0
 #define DELAY_VIA_PCM		1
+
 
 #define ROUNDUP(val, blksz)	(((val)+((blksz)-1)) & ~(blksz-1))
 
-typedef struct {
-	uint32_t info, src, dst, length,
-		 stride, next, pad[2];
-} dma_cb_t;
+
 
 #define BUS_TO_PHYS(x) ((x)&~0xC0000000)
 
@@ -171,128 +109,7 @@ typedef struct {
 static char *default_p1_pins = "7,11,12,13,15,16,18,22";
 static char *default_p5_pins = "";
 
-static uint8_t rev1_p1pin2gpio_map[] = {
-	DMY,	// P1-1   3v3
-	DMY,	// P1-2   5v
-	0,	// P1-3   GPIO 0 (SDA)
-	DMY,	// P1-4   5v
-	1,	// P1-5   GPIO 1 (SCL)
-	DMY,	// P1-6   Ground
-	4,	// P1-7   GPIO 4 (GPCLK0)
-	14,	// P1-8   GPIO 14 (TXD)
-	DMY,	// P1-9   Ground
-	15,	// P1-10  GPIO 15 (RXD)
-	17,	// P1-11  GPIO 17
-	18,	// P1-12  GPIO 18 (PCM_CLK)
-	21,	// P1-13  GPIO 21
-	DMY,	// P1-14  Ground
-	22,	// P1-15  GPIO 22
-	23,	// P1-16  GPIO 23
-	DMY,	// P1-17  3v3
-	24,	// P1-18  GPIO 24
-	10,	// P1-19  GPIO 10 (MOSI)
-	DMY,	// P1-20  Ground
-	9,	// P1-21  GPIO 9 (MISO)
-	25,	// P1-22  GPIO 25
-	11,	// P1-23  GPIO 11 (SCLK)
-	8,	// P1-24  GPIO 8 (CE0)
-	DMY,	// P1-25  Ground
-	7,	// P1-26  GPIO 7 (CE1)
-};
 
-static uint8_t rev1_p5pin2gpio_map[] = {
-	DMY,	// (P5-1 on rev 2 boards)
-	DMY,	// (P5-2 on rev 2 boards)
-	DMY,	// (P5-3 on rev 2 boards)
-	DMY,	// (P5-4 on rev 2 boards)
-	DMY,	// (P5-5 on rev 2 boards)
-	DMY,	// (P5-6 on rev 2 boards)
-	DMY,	// (P5-7 on rev 2 boards)
-	DMY,	// (P5-8 on rev 2 boards)
-};
-
-static uint8_t rev2_p1pin2gpio_map[] = {
-	DMY,	// P1-1   3v3
-	DMY,	// P1-2   5v
-	2,	// P1-3   GPIO 2 (SDA)
-	DMY,	// P1-4   5v
-	3,	// P1-5   GPIO 3 (SCL)
-	DMY,	// P1-6   Ground
-	4,	// P1-7   GPIO 4 (GPCLK0)
-	14,	// P1-8   GPIO 14 (TXD)
-	DMY,	// P1-9   Ground
-	15,	// P1-10  GPIO 15 (RXD)
-	17,	// P1-11  GPIO 17
-	18,	// P1-12  GPIO 18 (PCM_CLK)
-	27,	// P1-13  GPIO 27
-	DMY,	// P1-14  Ground
-	22,	// P1-15  GPIO 22
-	23,	// P1-16  GPIO 23
-	DMY,	// P1-17  3v3
-	24,	// P1-18  GPIO 24
-	10,	// P1-19  GPIO 10 (MOSI)
-	DMY,	// P1-20  Ground
-	9,	// P1-21  GPIO 9 (MISO)
-	25,	// P1-22  GPIO 25
-	11,	// P1-23  GPIO 11 (SCLK)
-	8,	// P1-24  GPIO 8 (CE0)
-	DMY,	// P1-25  Ground
-	7,	// P1-26  GPIO 7 (CE1)
-};
-
-static uint8_t rev2_p5pin2gpio_map[] = {
-	DMY,	// P5-1   5v0
-	DMY,	// P5-2   3v3
-	28,	// P5-3   GPIO 28 (I2C0_SDA)
-	29,	// P5-4   GPIO 29 (I2C0_SCL)
-	30,	// P5-5   GPIO 30
-	31,	// P5-6   GPIO 31
-	DMY,	// P5-7   Ground
-	DMY,	// P5-8   Ground
-};
-
-static uint8_t bplus_p1pin2gpio_map[] = {
-	DMY,	// P1-1   3v3
-	DMY,	// P1-2   5v
-	2,	// P1-3   GPIO 2 (SDA)
-	DMY,	// P1-4   5v
-	3,	// P1-5   GPIO 3 (SCL)
-	DMY,	// P1-6   Ground
-	4,	// P1-7   GPIO 4 (GPCLK0)
-	14,	// P1-8   GPIO 14 (TXD)
-	DMY,	// P1-9   Ground
-	15,	// P1-10  GPIO 15 (RXD)
-	17,	// P1-11  GPIO 17
-	18,	// P1-12  GPIO 18 (PCM_CLK)
-	27,	// P1-13  GPIO 27
-	DMY,	// P1-14  Ground
-	22,	// P1-15  GPIO 22
-	23,	// P1-16  GPIO 23
-	DMY,	// P1-17  3v3
-	24,	// P1-18  GPIO 24
-	10,	// P1-19  GPIO 10 (MOSI)
-	DMY,	// P1-20  Ground
-	9,	// P1-21  GPIO 9 (MISO)
-	25,	// P1-22  GPIO 25
-	11,	// P1-23  GPIO 11 (SCLK)
-	8,	// P1-24  GPIO 8 (CE0)
-	DMY,	// P1-25  Ground
-	7,	// P1-26  GPIO 7 (CE1)
-	DMY,	// P1-27  ID_SD
-	DMY,	// P1-28  ID_SC
-	5,	// P1-29  GPIO 5
-	DMY,	// P1-30  Ground
-	6,	// P1-31  GPIO 5
-	12,	// P1-32  GPIO 12
-	13,	// P1-33  GPIO 13
-	DMY,	// P1-34  Ground
-	19,	// P1-35  GPIO 19
-	16,	// P1-36  GPIO 16
-	26,	// P1-37  GPIO 26
-	20,	// P1-38  GPIO 20
-	DMY,	// P1-39  Ground
-	21,	// P1-40  GPIO 21
-};
 
 // bcm_host_get_model_type() return values to name mapping
 static const char *model_names[] = {
