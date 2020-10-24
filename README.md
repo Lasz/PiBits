@@ -1,1 +1,1 @@
-ServoBlaster:  A kernel driver that lets you control 8 (or more) servos from your RaspberryPi.
+Modification of ServoBlaster to drive multiple WS2812B LED strings simultaneously.

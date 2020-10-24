@@ -1,5 +1,5 @@
 /*
- * servodebug.c - a utility to help debug issues with ServoBlaster
+ * servodebug.c - a utility to help debug issues with ledek
  *
  * This code should be compiled with the command:
  *
