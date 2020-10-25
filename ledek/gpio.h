@@ -24,4 +24,11 @@
 #define GPIO_MODE_IN		0
 #define GPIO_MODE_OUT		1
 
+uint32_t gpio_get_mode(uint32_t gpio);
+void gpio_set_mode(uint32_t gpio, uint32_t mode);
+void gpio_set(int gpio, int level);
+void parse_pin_lists(int p1first, char *p1pins, char*p5pins);
+uint8_t gpiosearch(uint8_t gpio, uint8_t *map, int len);
+char * gpio2pinname(uint8_t gpio);
+
 #endif //LEDEK_GPIO

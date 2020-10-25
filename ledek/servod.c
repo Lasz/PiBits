@@ -48,6 +48,7 @@
 #include "clk.h"
 #include "dma.h"
 #include "gpio.h"
+#include "hardware.h"
 #include "pwm.h"
 
 
@@ -75,7 +76,6 @@
 #define PCM_VIRT_BASE		(periph_virt_base + PCM_BASE_OFFSET)
 #define PCM_PHYS_BASE		(periph_phys_base + PCM_BASE_OFFSET)
 
-
 #define PCM_CS_A		(0x00/4)
 #define PCM_FIFO_A		(0x04/4)
 #define PCM_MODE_A		(0x08/4)
@@ -95,9 +95,6 @@
 #define ROUNDUP(val, blksz)	(((val)+((blksz)-1)) & ~(blksz-1))
 
 
-
-#define BUS_TO_PHYS(x) ((x)&~0xC0000000)
-
 /* Define which P1 header pins to use by default.  These are the eight standard
  * GPIO pins (those coloured green in the diagram on this page:
  *    http://elinux.org/Rpi_Low-level_peripherals
@@ -109,14 +106,6 @@
 static char *default_p1_pins = "7,11,12,13,15,16,18,22";
 static char *default_p5_pins = "";
 
-
-
-// bcm_host_get_model_type() return values to name mapping
-static const char *model_names[] = {
-	"A", "B", "A+", "B+", "2B", "Alpha", "CM", "CM2", "3B", "Zero", "CM3",
-	"Custom", "ZeroW", "3B+", "3A+", "FPGA", "CM3+", "4B"
-};
-#define NUM_MODELS	(sizeof(model_names)/sizeof(*model_names))
 
 // cycle_time_us is the pulse cycle time per servo, in microseconds.
 // Typically it should be 20ms, or 20000us.
@@ -138,13 +127,6 @@ static int num_servos;
 static uint32_t gpiomode[MAX_SERVOS];
 static int restore_gpio_modes;
 
-static volatile uint32_t *pwm_reg;
-static volatile uint32_t *pcm_reg;
-static volatile uint32_t *clk_reg;
-static volatile uint32_t *dma_reg;
-static volatile uint32_t *gpio_reg;
-
-static int delay_hw = DELAY_VIA_PWM;
 
 static struct timeval *servo_kill_time;
 
@@ -164,18 +146,6 @@ static dma_cb_t *cb_base;
 static int board_model;
 static int gpio_cfg;
 
-static uint32_t periph_phys_base;
-static uint32_t periph_virt_base;
-static uint32_t dram_phys_base;
-static uint32_t mem_flag;
-
-static char *gpio_desc[] = {
-	"Unknown",
-	"P1 (26 pins)",
-	"P1 (26 pins), P5 (8 pins)",
-	"P1 (40 pins)"
-};
-
 static struct {
 	int handle;		/* From mbox_open() */
 	uint32_t size;		/* Required size */
@@ -189,57 +159,8 @@ static void set_servo_idle(int servo);
 static void gpio_set_mode(uint32_t gpio, uint32_t mode);
 static char *gpio2pinname(uint8_t gpio);
 
-static void
-udelay(int us)
-{
-	struct timespec ts = { 0, us * 1000 };
 
-	nanosleep(&ts, NULL);
-}
 
-static void
-terminate(int dummy)
-{
-	int i;
-
-	if (dma_reg && mbox.virt_addr) {
-		for (i = 0; i < MAX_SERVOS; i++) {
-			if (servo2gpio[i] != DMY)
-				set_servo(i, 0);
-		}
-		udelay(cycle_time_us);
-		dma_reg[DMA_CS] = DMA_RESET;
-		udelay(10);
-	}
-	if (restore_gpio_modes) {
-		for (i = 0; i < MAX_SERVOS; i++) {
-			if (servo2gpio[i] != DMY)
-				gpio_set_mode(servo2gpio[i], gpiomode[i]);
-		}
-	}
-	if (mbox.virt_addr != NULL) {
-		unmapmem(mbox.virt_addr, mbox.size);
-		mem_unlock(mbox.handle, mbox.mem_ref);
-		mem_free(mbox.handle, mbox.mem_ref);
-		if (mbox.handle >= 0)
-			mbox_close(mbox.handle);
-	}
-
-	unlink(DEVFILE);
-	unlink(CFGFILE);
-	exit(1);
-}
-
-static void
-fatal(char *fmt, ...)
-{
-	va_list ap;
-
-	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	va_end(ap);
-	terminate(0);
-}
 
 static void
 init_idle_timers(void)
@@ -294,31 +215,6 @@ get_next_idle_timeout(struct timeval *tv)
 	*tv = min;
 }
 
-static uint32_t gpio_get_mode(uint32_t gpio)
-{
-	uint32_t fsel = gpio_reg[GPIO_FSEL0 + gpio/10];
-
-	return (fsel >> ((gpio % 10) * 3)) & 7;
-}
-
-static void
-gpio_set_mode(uint32_t gpio, uint32_t mode)
-{
-	uint32_t fsel = gpio_reg[GPIO_FSEL0 + gpio/10];
-
-	fsel &= ~(7 << ((gpio % 10) * 3));
-	fsel |= mode << ((gpio % 10) * 3);
-	gpio_reg[GPIO_FSEL0 + gpio/10] = fsel;
-}
-
-static void
-gpio_set(int gpio, int level)
-{
-	if (level)
-		gpio_reg[GPIO_SET0] = 1 << gpio;
-	else
-		gpio_reg[GPIO_CLR0] = 1 << gpio;
-}
 
 static uint32_t
 mem_virt_to_phys(void *virt)
@@ -410,21 +306,7 @@ set_servo(int servo, int width)
 	update_idle_time(servo);
 }
 
-static void
-setup_sighandlers(void)
-{
-	int i;
 
-	// Catch all signals possible - it is vital we kill the DMA engine
-	// on process exit!
-	for (i = 0; i < 64; i++) {
-		struct sigaction sa;
-
-		memset(&sa, 0, sizeof(sa));
-		sa.sa_handler = terminate;
-		sigaction(i, &sa, NULL);
-	}
-}
 
 static void
 init_ctrl_data(void)
@@ -507,62 +389,6 @@ init_ctrl_data(void)
 	}
 	cbp--;
 	cbp->next = mem_virt_to_phys(cb_base);
-}
-
-static void
-init_hardware(void)
-{
-	if (delay_hw == DELAY_VIA_PWM) {
-		// Initialise PWM
-		pwm_reg[PWM_CTL] = 0;
-		udelay(10);
-		clk_reg[PWMCLK_CNTL] = 0x5A000006;		// Source=PLLD (500MHz or 750MHz on Pi4)
-		udelay(100);
-		clk_reg[PWMCLK_DIV] = 0x5A000000 | (plldfreq_mhz<<12);	// set pwm div to give 1MHz
-		udelay(100);
-		clk_reg[PWMCLK_CNTL] = 0x5A000016;		// Source=PLLD and enable
-		udelay(100);
-		pwm_reg[PWM_RNG1] = step_time_us;
-		udelay(10);
-		pwm_reg[PWM_DMAC] = PWMDMAC_ENAB | PWMDMAC_THRSHLD;
-		udelay(10);
-		pwm_reg[PWM_CTL] = PWMCTL_CLRF;
-		udelay(10);
-		pwm_reg[PWM_CTL] = PWMCTL_USEF1 | PWMCTL_PWEN1;
-		udelay(10);
-	} else {
-		// Initialise PCM
-		pcm_reg[PCM_CS_A] = 1;				// Disable Rx+Tx, Enable PCM block
-		udelay(100);
-		clk_reg[PCMCLK_CNTL] = 0x5A000006;		// Source=PLLD (500MHz or 750MHz on Pi4)
-		udelay(100);
-		clk_reg[PCMCLK_DIV] = 0x5A000000 | (plldfreq_mhz<<12);	// Set pcm div to give 1MHz
-		udelay(100);
-		clk_reg[PCMCLK_CNTL] = 0x5A000016;		// Source=PLLD and enable
-		udelay(100);
-		pcm_reg[PCM_TXC_A] = 0<<31 | 1<<30 | 0<<20 | 0<<16; // 1 channel, 8 bits
-		udelay(100);
-		pcm_reg[PCM_MODE_A] = (step_time_us - 1) << 10;
-		udelay(100);
-		pcm_reg[PCM_CS_A] |= 1<<4 | 1<<3;		// Clear FIFOs
-		udelay(100);
-		pcm_reg[PCM_DREQ_A] = 64<<24 | 64<<8;		// DMA Req when one slot is free?
-		udelay(100);
-		pcm_reg[PCM_CS_A] |= 1<<9;			// Enable DMA
-		udelay(100);
-	}
-
-	// Initialise the DMA
-	dma_reg[DMA_CS] = DMA_RESET;
-	udelay(10);
-	dma_reg[DMA_CS] = DMA_INT | DMA_END;
-	dma_reg[DMA_CONBLK_AD] = mem_virt_to_phys(cb_base);
-	dma_reg[DMA_DEBUG] = 7; // clear debug error flags
-	dma_reg[DMA_CS] = 0x10880001;	// go, mid priority, wait for outstanding writes
-
-	if (delay_hw == DELAY_VIA_PCM) {
-		pcm_reg[PCM_CS_A] |= 1<<2;			// Enable Tx
-	}
 }
 
 static void
@@ -759,210 +585,7 @@ go_go_go(void)
  *
  * NOTE: These days we should just use bcm_host_get_model_type().
  */
-static void
-get_model_and_revision(void)
-{
-	char buf[128], revstr[128], modelstr[128];
-	char *ptr, *end, *res;
-	int board_revision;
-	FILE *fp;
 
-	revstr[0] = modelstr[0] = '\0';
-
-	fp = fopen("/proc/cpuinfo", "r");
-
-	if (!fp)
-		fatal("Unable to open /proc/cpuinfo: %m\n");
-
-	while ((res = fgets(buf, 128, fp))) {
-		if (!strncasecmp("hardware", buf, 8))
-			memcpy(modelstr, buf, 128);
-		else if (!strncasecmp(buf, "revision", 8))
-			memcpy(revstr, buf, 128);
-	}
-	fclose(fp);
-
-	if (modelstr[0] == '\0')
-		fatal("servod: No 'Hardware' record in /proc/cpuinfo\n");
-	if (revstr[0] == '\0')
-		fatal("servod: No 'Revision' record in /proc/cpuinfo\n");
-
-	if (strstr(modelstr, "BCM2708"))
-		board_model = 1;
-	else if (strstr(modelstr, "BCM2709") || strstr(modelstr, "BCM2835"))
-		board_model = 2;
-	else
-		fatal("servod: Cannot parse the hardware name string\n");
-
-	/* Revisions documented at http://elinux.org/RPi_HardwareHistory */
-	ptr = revstr + strlen(revstr) - 3;
-	board_revision = strtol(ptr, &end, 16);
-	if (end != ptr + 2)
-		fatal("servod: Failed to parse Revision string\n");
-	if (board_revision < 1)
-		fatal("servod: Invalid board Revision\n");
-	else if (board_revision < 4)
-		gpio_cfg = 1;
-	else if (board_revision < 16)
-		gpio_cfg = 2;
-	else
-		gpio_cfg = 3;
-
-	if (bcm_host_is_model_pi4()) {
-		plldfreq_mhz = PLLDFREQ_MHZ_PI4;
-		dma_chan = DMA_CHAN_PI4;
-	} else {
-		plldfreq_mhz = PLLDFREQ_MHZ_DEFAULT;
-		dma_chan = DMA_CHAN_DEFAULT;
-	}
-
-	periph_virt_base = bcm_host_get_peripheral_address();
-	dram_phys_base = bcm_host_get_sdram_address();
-	periph_phys_base = 0x7e000000;
-
-	/*
-	 * See https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface
-	 *
-	 * 1:  MEM_FLAG_DISCARDABLE = 1 << 0	// can be resized to 0 at any time. Use for cached data
-	 *     MEM_FLAG_NORMAL = 0 << 2		// normal allocating alias. Don't use from ARM
-	 * 4:  MEM_FLAG_DIRECT = 1 << 2		// 0xC alias uncached
-	 * 8:  MEM_FLAG_COHERENT = 2 << 2	// 0x8 alias. Non-allocating in L2 but coherent
-	 *     MEM_FLAG_L1_NONALLOCATING =	// Allocating in L2
-	 *       (MEM_FLAG_DIRECT | MEM_FLAG_COHERENT)
-	 * 16: MEM_FLAG_ZERO = 1 << 4		// initialise buffer to all zeros
-	 * 32: MEM_FLAG_NO_INIT = 1 << 5	// don't initialise (default is initialise to all ones
-	 * 64: MEM_FLAG_HINT_PERMALOCK = 1 << 6	// Likely to be locked for long periods of time
-	 *
-	 */
-	if (board_model == 1) {
-		mem_flag         = 0x0c;	/* MEM_FLAG_DIRECT | MEM_FLAG_COHERENT */
-	} else {
-		mem_flag         = 0x04;	/* MEM_FLAG_DIRECT */
-	}
-}
-
-static void
-parse_pin_lists(int p1first, char *p1pins, char*p5pins)
-{
-	char *name, *pins;
-	int i, mapcnt;
-	uint8_t *map, *pNpin2servo;
-	int lst, servo = 0;
-	FILE *fp;
-
-	memset(servo2gpio, DMY, sizeof(servo2gpio));
-	memset(p1pin2servo, DMY, sizeof(p1pin2servo));
-	memset(p5pin2servo, DMY, sizeof(p5pin2servo));
-	for (lst = 0; lst < 2; lst++) {
-		if (lst == 0 && p1first) {
-			name = "P1";
-			pins = p1pins;
-			if (board_model == 1 && gpio_cfg == 1) {
-				map = rev1_p1pin2gpio_map;
-				mapcnt = sizeof(rev1_p1pin2gpio_map);
-			} else if (board_model == 1 && gpio_cfg == 2) {
-				map = rev2_p1pin2gpio_map;
-				mapcnt = sizeof(rev2_p1pin2gpio_map);
-			} else {
-				map = bplus_p1pin2gpio_map;
-				mapcnt = sizeof(bplus_p1pin2gpio_map);
-			}
-			pNpin2servo = p1pin2servo;
-		} else {
-			name = "P5";
-			pins = p5pins;
-			if (board_model == 1 && gpio_cfg == 1) {
-				map = rev1_p5pin2gpio_map;
-				mapcnt = sizeof(rev1_p5pin2gpio_map);
-			} else if (board_model == 1 && gpio_cfg == 2) {
-				map = rev2_p5pin2gpio_map;
-				mapcnt = sizeof(rev2_p5pin2gpio_map);
-			} else {
-				map = NULL;
-				mapcnt = 0;
-			}
-			pNpin2servo = p5pin2servo;
-		}
-		while (*pins) {
-			char *end;
-			long pin = strtol(pins, &end, 0);
-
-			if (*end && (end == pins || *end != ','))
-				fatal("Invalid character '%c' in %s pin list\n", *end, name);
-			if (pin < 0 || pin > mapcnt)
-				fatal("Invalid pin number %d in %s pin list\n", pin, name);
-			if (servo == MAX_SERVOS)
-				fatal("Too many servos specified\n");
-			if (pin == 0) {
-				servo++;
-			} else {
-				if (map[pin-1] == DMY)
-					fatal("Pin %d on header %s cannot be used for a servo output\n", pin, name);
-				pNpin2servo[pin] = servo;
-				servo2gpio[servo++] = map[pin-1];
-				num_servos++;
-			}
-			pins = end;
-			if (*pins == ',')
-				pins++;
-		}
-	}
-	/* Write a cfg file so can tell which pins are used for servos */
-	fp = fopen(CFGFILE, "w");
-	if (fp) {
-		if (p1first)
-			fprintf(fp, "p1pins=%s\np5pins=%s\n", p1pins, p5pins);
-		else
-			fprintf(fp, "p5pins=%s\np1pins=%s\n", p5pins, p1pins);
-		fprintf(fp, "\nServo mapping:\n");
-		for (i = 0; i < MAX_SERVOS; i++) {
-			if (servo2gpio[i] == DMY)
-				continue;
-			fprintf(fp, "    %2d on %-5s          GPIO-%d\n", i, gpio2pinname(servo2gpio[i]), servo2gpio[i]);
-		}
-		fclose(fp);
-	}
-}
-
-static uint8_t
-gpiosearch(uint8_t gpio, uint8_t *map, int len)
-{
-	while (--len) {
-		if (map[len] == gpio)
-			return len+1;
-	}
-	return 0;
-}
-
-static char *
-gpio2pinname(uint8_t gpio)
-{
-	static char res[16];
-	uint8_t pin;
-
-	if (board_model == 1 && gpio_cfg == 1) {
-		if ((pin = gpiosearch(gpio, rev1_p1pin2gpio_map, sizeof(rev1_p1pin2gpio_map))))
-			sprintf(res, "P1-%d", pin);
-		else if ((pin = gpiosearch(gpio, rev1_p5pin2gpio_map, sizeof(rev1_p5pin2gpio_map))))
-			sprintf(res, "P5-%d", pin);
-		else
-			fatal("Cannot map GPIO %d to a header pin\n", gpio);
-	} else if (board_model == 1 && gpio_cfg == 2) {
-		if ((pin = gpiosearch(gpio, rev2_p1pin2gpio_map, sizeof(rev2_p1pin2gpio_map))))
-			sprintf(res, "P1-%d", pin);
-		else if ((pin = gpiosearch(gpio, rev2_p5pin2gpio_map, sizeof(rev2_p5pin2gpio_map))))
-			sprintf(res, "P5-%d", pin);
-		else
-			fatal("Cannot map GPIO %d to a header pin\n", gpio);
-	} else {
-		if ((pin = gpiosearch(gpio, bplus_p1pin2gpio_map, sizeof(bplus_p1pin2gpio_map))))
-			sprintf(res, "P1-%d", pin);
-		else
-			fatal("Cannot map GPIO %d to a header pin\n", gpio);
-	}
-
-	return res;
-}
 
 static int
 parse_min_max_arg(char *arg, char *name)

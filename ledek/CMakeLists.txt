@@ -16,6 +16,7 @@ list( APPEND SOURCE_FILES
         clk.c
         dma.c
         gpio.c
+        hardware.c
         mailbox.c
         main.c
         pwm.c
@@ -25,6 +26,7 @@ list( APPEND HEADER_FILES
         clk.h
         dma.h
         gpio.h
+        hardware.h
         mailbox.h
         pwm.h
 )
